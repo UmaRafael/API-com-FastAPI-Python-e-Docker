@@ -1,0 +1,157 @@
+import asyncio
+import logging
+from logging.config import fileConfig
+from typing import Any
+
+from sqlalchemy.engine import Connection
+from sqlalchemy.ext.asyncio import async_engine_from_config, create_async_engine
+from sqlalchemy import pool, text
+
+from alembic import context
+from workout_api.contrib.models import BaseModel
+from workout_api.core.configs import settings  # Importar configurações
+from workout_api.contrib.repository.models import *
+
+# Configurar logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+config = context.config
+
+if config.config_file_name is not None:
+    fileConfig(config.config_file_name)
+
+target_metadata = BaseModel.metadata
+
+def get_database_url() -> str:
+    """Obtém a URL do banco de forma segura."""
+    try:
+        # Tenta pegar das configurações da aplicação primeiro
+        return settings.DB_URL
+    except (AttributeError, ImportError):
+        # Fallback para a configuração do alembic.ini
+        url = config.get_main_option("sqlalchemy.url")
+        if not url:
+            raise ValueError(
+                "Database URL não configurada. "
+                "Defina DB_URL nas settings ou sqlalchemy.url no alembic.ini"
+            )
+        return url
+
+def run_migrations_offline() -> None:
+    """Run migrations in 'offline' mode."""
+    url = get_database_url()
+    
+    context.configure(
+        url=url,
+        target_metadata=target_metadata,
+        literal_binds=True,
+        dialect_opts={"paramstyle": "named"},
+        compare_type=True,  # Detecta mudanças de tipo
+        compare_server_default=True,  # Detecta mudanças em defaults
+    )
+
+    with context.begin_transaction():
+        context.run_migrations()
+        logger.info("Migração offline gerada com sucesso")
+
+def do_run_migrations(connection: Connection) -> None:
+    """Executa as migrações com configurações otimizadas."""
+    context.configure(
+        connection=connection,
+        target_metadata=target_metadata,
+        compare_type=True,
+        compare_server_default=True,
+        transaction_per_migration=True,  # Transação por migração
+        version_table="alembic_version",  # Nome da tabela de versão
+        version_table_schema=None,  # Schema para a tabela de versão
+        user_module_prefix=None,
+        render_as_batch=True,  # Melhor suporte para SQLite/MySQL
+    )
+
+    with context.begin_transaction():
+        context.run_migrations()
+        logger.info("Migração online executada com sucesso")
+
+async def run_async_migrations() -> None:
+    """Executa migrações de forma assíncrona com tratamento de erros."""
+    database_url = get_database_url()
+    
+    # Configuração otimizada para async
+    configuration = config.get_section(config.config_ini_section) or {}
+    configuration["sqlalchemy.url"] = database_url
+    
+    # Pool de conexões otimizado para async
+    connectable = async_engine_from_config(
+        configuration,
+        prefix="sqlalchemy.",
+        poolclass=pool.AsyncAdaptedQueuePool,
+        pool_size=5,
+        max_overflow=10,
+        pool_timeout=30,
+        pool_recycle=1800,
+        echo=False,  # Desativar echo em produção
+    )
+
+    try:
+        async with connectable.connect() as connection:
+            # Verificar se a conexão está ativa
+            await connection.scalar(text("SELECT 1"))
+            logger.info("Conexão com o banco estabelecida")
+            
+            await connection.run_sync(do_run_migrations)
+            
+    except Exception as e:
+        logger.error(f"Erro durante a migração: {e}")
+        raise
+    finally:
+        await connectable.dispose()
+        logger.info("Conexão com o banco fechada")
+
+async def check_database_connection() -> bool:
+    """Verifica se a conexão com o banco está ativa."""
+    try:
+        database_url = get_database_url()
+        engine = create_async_engine(database_url, echo=False)
+        async with engine.connect() as conn:
+            await conn.scalar(text("SELECT 1"))
+            await engine.dispose()
+            return True
+    except Exception as e:
+        logger.warning(f"Falha na conexão com o banco: {e}")
+        return False
+
+def run_migrations_online() -> None:
+    """Executa migrações online com verificação de conexão."""
+    try:
+        # Verificar conexão antes de migrar
+        if asyncio.run(check_database_connection()):
+            asyncio.run(run_async_migrations())
+        else:
+            logger.error("Não foi possível conectar ao banco de dados")
+            raise ConnectionError("Falha na conexão com o banco de dados")
+            
+    except KeyboardInterrupt:
+        logger.info("Migração cancelada pelo usuário")
+        raise
+    except Exception as e:
+        logger.error(f"Erro fatal durante a migração: {e}")
+        raise
+
+# Adicionar hook para pre-migration
+def include_object(object, name, type_, reflected, compare_to):
+    """Filtra objetos para inclusão nas migrações."""
+    if type_ == "table" and name.startswith("tmp_"):
+        return False  # Ignorar tabelas temporárias
+    return True
+
+# Configurações adicionais para o context
+context.configure(
+    include_object=include_object,
+    include_schemas=True,  # Incluir schemas se existirem
+)
+
+if context.is_offline_mode():
+    run_migrations_offline()
+else:
+    run_migrations_online()
