@@ -1,0 +1,17 @@
+from pydantic import BaseSettings, PostgresDsn
+from typing import Optional
+
+class Settings(BaseSettings):
+    """Configurações da aplicação."""
+    
+    DB_URL: PostgresDsn = "postgresql+asyncpg://user:password@localhost:5432/dbname"
+    
+    # Configurações do Alembic
+    ALEMBIC_MIGRATION_DIR: str = "alembic/versions"
+    ALEMBIC_INI_PATH: str = "alembic.ini"
+    
+    class Config:
+        env_file = ".env"
+        case_sensitive = True
+
+settings = Settings()
